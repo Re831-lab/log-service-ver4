@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript build check
+        run: npm run build
+
+      - name: Start services with docker compose
+        run: docker compose up -d --build
+
+      - name: Wait for service to become healthy
+        run: |
+          echo "Waiting for /health to return 200..."
+          for i in $(seq 1 30); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "Service is healthy."
+              exit 0
+            fi
+            echo "Attempt $i: status=$STATUS, retrying in 2s..."
+            sleep 2
+          done
+          echo "Service did not become healthy in time."
+          docker compose logs
+          exit 1
+
+      # --- Smoke test: the four required endpoints, unauthenticated ---
+
+      - name: Smoke test - GET /health
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health)
+          echo "GET /health -> $STATUS"
+          if [ "$STATUS" != "200" ]; then exit 1; fi
+
+      - name: Smoke test - POST /logs (valid entry)
+        run: |
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8080/logs \
+            -H "Content-Type: application/json" \
+            -d "{\"logs\":[{\"timestamp\":\"$NOW\",\"level\":\"info\",\"service\":\"ci-test\",\"message\":\"smoke test log\",\"attributes\":{\"source\":\"ci\"}}]}")
+          STATUS=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          echo "POST /logs -> $STATUS"
+          echo "Body: $BODY"
+          if [ "$STATUS" != "200" ]; then exit 1; fi
+          echo "$BODY" | grep -q '"accepted":1' || (echo "Expected accepted:1 in response" && exit 1)
+
+      - name: Smoke test - POST /logs (invalid entry returns 400)
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8080/logs \
+            -H "Content-Type: application/json" \
+            -d '{"logs":[{"level":"not-a-real-level","service":"ci-test","message":"bad log"}]}')
+          STATUS=$(echo "$RESPONSE" | tail -n1)
+          echo "POST /logs (invalid) -> $STATUS"
+          if [ "$STATUS" != "400" ]; then exit 1; fi
+
+      - name: Smoke test - GET /logs
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080/logs?service=ci-test&limit=10")
+          echo "GET /logs -> $STATUS"
+          if [ "$STATUS" != "200" ]; then exit 1; fi
+
+      - name: Smoke test - GET /logs/aggregate
+        run: |
+          SINCE=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -v-1H +%Y-%m-%dT%H:%M:%S.000Z)
+          UNTIL=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080/logs/aggregate?since=$SINCE&until=$UNTIL&bucket=1h")
+          echo "GET /logs/aggregate -> $STATUS"
+          if [ "$STATUS" != "200" ]; then exit 1; fi
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down

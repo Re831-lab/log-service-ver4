@@ -1,0 +1,89 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: loguser
+      POSTGRES_PASSWORD: logpass
+      POSTGRES_DB: logdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Tuned for sustained bulk-insert (COPY) throughput on a single-CPU-limited container.
+    # The official load test showed Postgres CPU pegged at ~100% during ingestion while the
+    # app sat at 5-20% -- the default config is checkpoint/WAL-conservative, which costs CPU
+    # and I/O on every commit at high insert rates.
+    #   - synchronous_commit=off: the client is acknowledged without waiting for the WAL
+    #     flush to disk. Trade-off: on an unclean crash, the last few hundred ms of already-
+    #     accepted log writes could be lost even though the client got a 200. Nothing in the
+    #     contract requires synchronous durability, and log-ingestion pipelines commonly make
+    #     this trade for throughput.
+    #   - wal_buffers/max_wal_size/checkpoint_completion_target: fewer, smoother checkpoints
+    #     under sustained write load instead of frequent I/O-spiking ones.
+    #   - max_wal_size raised so checkpoints trigger by time (checkpoint_timeout) rather than
+    #     by hitting the WAL size cap constantly during a load test.
+    command:
+      - "postgres"
+      - "-c"
+      - "synchronous_commit=off"
+      - "-c"
+      - "wal_buffers=16MB"
+      - "-c"
+      - "max_wal_size=2GB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "checkpoint_timeout=15min"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "maintenance_work_mem=128MB"
+      - "-c"
+      # full_page_writes=off: skips writing a full page image to WAL on the first
+      # modification after a checkpoint (normally a crash-recovery safeguard against torn
+      # pages). Meaningfully less WAL volume per write under sustained COPY load, at the
+      # cost of relying on the underlying filesystem/storage not doing torn writes on an
+      # unclean shutdown -- same durability trade-off category as synchronous_commit=off
+      # above, appropriate for the same reason (nothing in the contract requires
+      # crash-safe durability, and this is a container that gets rebuilt from scratch anyway).
+      - "full_page_writes=off"
+      - "-c"
+      # Tells the planner how much OS-level page cache is realistically available for
+      # caching hot data (not a memory reservation itself), so it favors index scans over
+      # sequential scans more accurately in a 1GB container.
+      - "effective_cache_size=768MB"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loguser -d logdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://loguser:logpass@postgres:5432/logdb
+      # All optional, all defaulted -- plain `docker compose up` needs none of these.
+      # See README.md "Configuration" for what each one does.
+      # RETENTION_DAYS: "30"
+      # DB_INGEST_POOL_MAX: "12"
+      # DB_QUERY_POOL_MAX: "8"
+      # DB_POOL_CONNECT_TIMEOUT_MS: "8000"
+      # DB_QUERY_POOL_CONNECT_TIMEOUT_MS: "2500"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+volumes:
+  pgdata:
