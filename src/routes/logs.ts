@@ -6,9 +6,6 @@ import { validateAggregateParams } from "../validation/queryValidation.js";
 import { queryAggregate } from "../repositories/logRepository.js";
 import { isPoolExhaustionError } from "../utils/poolErrors.js";
 
-// POST /logs: transient DB-pool overload is shed with 503 + Retry-After. The contract's Rate
-// Limiting and Backpressure section explicitly sanctions this ("shedding load with 429 or 503
-// ... is better than crashing") for ingestion specifically.
 function respondToIngestDbError(res: Response, err: unknown, context: string): Response {
   if (isPoolExhaustionError(err)) {
     console.warn(`${context}: database pool exhausted, shedding load with 503`);
@@ -21,14 +18,7 @@ function respondToIngestDbError(res: Response, err: unknown, context: string): R
   return res.status(500).json({ error: "internal server error" });
 }
 
-// GET /logs and GET /logs/aggregate: their contract only documents 400 for invalid
-// parameters -- never 503. The query pool's timeout (see env.ts) is already generous enough
-// that hitting it at all means something is genuinely wedged, not just busy, so this is a
-// last-resort 500 rather than a load-shedding 503: better to surface a real error than to
-// return a status shape the contract never described. Critically, this function existing at
-// all (wrapped in try/catch at the call site) is still the fix for the original bug: an
-// uncaught rejection in an Express 4 async handler never reaches error middleware and just
-// hangs the request forever. This turns that hang into a bounded wait plus a definite response.
+
 function respondToQueryDbError(res: Response, err: unknown, context: string): Response {
   console.error(`${context}:`, err);
   return res.status(500).json({ error: "internal server error" });
