@@ -19,8 +19,7 @@ app.get("/health", async (req, res) => {
     return res.status(503).json({ status: "not ready" });
   }
   try {
-    // Dedicated pool -- a liveness check must never queue behind application
-    // query/ingestion load, so it can't be misreported unhealthy from pure traffic.
+
     await healthPool.query("SELECT 1");
     return res.status(200).json({ status: "ok" });
   } catch {
@@ -40,17 +39,13 @@ app.use(
     if (err instanceof SyntaxError && "body" in err) {
       return res.status(400).json({ error: "malformed JSON in request body" });
     }
-    // Last-resort safety net for anything that reaches here uncaught (routes now handle their
-    // own DB errors -- see routes/logs.ts). No route this applies to has a contract-sanctioned
-    // 503 shape other than POST /logs, which already handles its own errors before bubbling
-    // here, so this stays a plain 500 rather than guessing at 503.
+
     console.error(err);
     res.status(500).json({ error: "internal server error" });
   }
 );
 
-// Safety net: any promise rejection that still slips past a route's own try/catch (e.g. a
-// bug in future code) should never silently hang a request or crash the process outright.
+
 process.on("unhandledRejection", (reason) => {
   console.error("Unhandled rejection:", reason);
 });
