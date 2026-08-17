@@ -13,9 +13,6 @@ function csvField(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
 }
 
-// Aggregates this flush's entries into per-(minute, service, level) counts and returns a
-// single batched upsert against log_rollups. Returns null when there's nothing to roll up
-// (shouldn't happen since insertLogs rejects empty arrays, but kept defensive).
 function buildRollupUpsert(
   batches: PendingBatch[]
 ): { text: string; values: unknown[] } | null {
@@ -24,8 +21,7 @@ function buildRollupUpsert(
   for (const batch of batches) {
     for (const e of batch.entries) {
       const bucketMs = Math.floor(e.timestamp.getTime() / 60_000) * 60_000;
-      // JSON.stringify as the map key avoids ambiguity from service/level values that
-      // might themselves contain a plain delimiter character like "|" or ",".
+   
       const key = JSON.stringify([new Date(bucketMs).toISOString(), e.service, e.level]);
       counts.set(key, (counts.get(key) ?? 0) + 1);
     }
@@ -64,10 +60,6 @@ let pendingBatches: PendingBatch[] = [];
 let pendingEntryCount = 0;
 let isFlushing = false;
 
-// حماية الذاكرة: الحاوية محدودة بـ256MB. لو postgres تباطأ (CPU pegged) والطابور
-// صار يكبر أسرع من الفلاش، لازم نرفض بدل ما نسمح للذاكرة تنفجر وتكراش العملية.
-// 503 هون مسموح صراحة بالـcontract لـ POST /logs تحديدًا (Rate Limiting and
-// Backpressure section) — عكس GET routes اللي ما بيسمحوا بـ503 أبدًا.
 const MAX_QUEUE_SIZE = 200_000;
 
 export class QueueFullError extends Error {
@@ -77,12 +69,6 @@ export class QueueFullError extends Error {
   }
 }
 
-// The official load test showed PostgreSQL CPU-bound (~100% of its single CPU) during
-// sustained ingestion, not the application. Flushing every 30ms meant up to ~33 separate
-// COPY streams (each its own commit/fsync) per second competing for that one CPU. Widening
-// the window to 75ms cuts that to ~13/sec while still comfortably meeting the "queryable
-// within 20 seconds" contract requirement -- a small increase in per-request ingestion
-// latency in exchange for meaningfully less commit overhead per second under load.
 const FLUSH_INTERVAL_MS = 75;
 
 export function insertLogs(entries: ValidatedLogEntry[]): Promise<void> {
@@ -109,8 +95,7 @@ setInterval(async () => {
   pendingEntryCount = 0;
 
   try {
-    // Ingestion uses its own pool so a burst of COPY-holding connections can never starve
-    // the query pool backing GET /logs and GET /logs/aggregate.
+ 
     const client = await ingestPool.connect();
     try {
       const ingestStream = client.query(
@@ -138,10 +123,6 @@ setInterval(async () => {
 
       await pipeline(sourceStream, ingestStream);
 
-      // Best-effort: the rows above are already durably written and the batch is
-      // correct regardless of what happens here. A rollup upsert failure must never
-      // fail an already-successful batch -- GET /logs/aggregate always has the raw
-      // `logs` table as a correct fallback (see queryAggregate below).
       try {
         const rollupUpsert = buildRollupUpsert(batchesToProcess);
         if (rollupUpsert) {
@@ -169,9 +150,6 @@ setInterval(async () => {
   }
 }, FLUSH_INTERVAL_MS);
 
-// -----------------------------------------------------------------------------
-// دوال الاستعلام (بدون تغيير)
-// -----------------------------------------------------------------------------
 
 export interface LogRow {
   id: number;
@@ -242,10 +220,7 @@ export async function queryAggregate(
 ): Promise<AggregateRow[]> {
   const hasAttrFilters = Object.keys(params.attributes).length > 0;
 
-  // The rollup table only stores counts per (minute, service, level) -- it has no
-  // message text and no arbitrary attributes, so it can only answer requests that don't
-  // filter on `q` or `attr.<key>`. Anything else falls through to the unchanged raw-table
-  // path below, which is always correct.
+  
   if (!params.q && !hasAttrFilters) {
     return queryAggregateFromRollup(params);
   }
