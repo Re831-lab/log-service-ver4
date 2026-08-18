@@ -97,6 +97,37 @@ export function insertLogs(entries: ValidatedLogEntry[]): Promise<void> {
   });
 }
 
+// Builds the COPY payload as an async generator instead of one big synchronous string
+// concatenation. With the app capped at 0.5 CPU, building a large flush's CSV in one
+// blocking loop held the event loop for the whole build -- no incoming HTTP request
+// (including /health) could even be accepted until it finished, and if one flush ran
+// long the next flush's batch grew larger, compounding the stall. Yielding a chunk every
+// 2000 rows and awaiting setImmediate() hands control back to the event loop periodically
+// so requests keep being accepted while a large flush is still being serialized.
+async function* generateCsvChunks(batches: PendingBatch[]) {
+  let buffer = "";
+  let rowCount = 0;
+  for (const batch of batches) {
+    for (const e of batch.entries) {
+      buffer +=
+        [
+          csvField(e.timestamp.toISOString()),
+          csvField(e.level),
+          csvField(e.service),
+          csvField(e.message),
+          csvField(JSON.stringify(e.attributes)),
+        ].join(",") + "\n";
+      rowCount++;
+      if (rowCount % 2000 === 0) {
+        yield buffer;
+        buffer = "";
+        await new Promise((r) => setImmediate(r));
+      }
+    }
+  }
+  if (buffer) yield buffer;
+}
+
 setInterval(async () => {
   if (isFlushing || pendingBatches.length === 0) return;
 
@@ -116,22 +147,7 @@ setInterval(async () => {
         )
       );
 
-      let csvData = "";
-      for (let i = 0; i < batchesToProcess.length; i++) {
-        const batch = batchesToProcess[i];
-        for (let j = 0; j < batch.entries.length; j++) {
-          const e = batch.entries[j];
-          csvData += [
-            csvField(e.timestamp.toISOString()),
-            csvField(e.level),
-            csvField(e.service),
-            csvField(e.message),
-            csvField(JSON.stringify(e.attributes)),
-          ].join(",") + "\n";
-        }
-      }
-
-      const sourceStream = Readable.from([csvData]);
+      const sourceStream = Readable.from(generateCsvChunks(batchesToProcess));
 
       await pipeline(sourceStream, ingestStream);
 
@@ -237,7 +253,7 @@ export async function queryAggregate(
 ): Promise<AggregateRow[]> {
   const hasAttrFilters = Object.keys(params.attributes).length > 0;
 
- 
+
   if (!params.q && !hasAttrFilters) {
     return queryAggregateFromRollup(params);
   }
